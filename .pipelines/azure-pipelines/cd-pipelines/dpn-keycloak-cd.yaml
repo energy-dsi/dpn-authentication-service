@@ -1,0 +1,598 @@
+trigger: none
+
+parameters:
+
+  - name: ServiceConnection
+    displayName: 'ServiceConnection details'
+    type: string
+    default: 'sc-dpn-dev-001'
+    values:
+      - sc-dpn-dev-001
+      - sc-dpn-dev-002
+      - sc-dpn-test-001
+      - sc-dpn-test-002
+      - sc-dpn-pdev-ppd-001
+      - sc-dpn-ptest-ppd-001
+      - sc-dpn-puat-ppd-001
+
+  - name: environment
+    displayName: Environment Name
+    type: string
+    default: 'dev'
+    values:
+      - dev
+      - devtest
+      - test
+      - pdev
+      - ptest
+      - puat
+
+  - name: dpnCluster
+    displayName: "DPN Cluster"
+    type: string
+    default: "dpn01"
+    values:
+      - dpn01
+      - dpn02
+
+variables:
+  - name: CHART_DIR
+    value: "charts/keycloak"
+
+  # Keycloak runs an implicit build on first boot, so allow generous headroom.
+  - name: HELM_TIMEOUT
+    value: "15m"
+
+  - name: RELEASE_NAME
+    value: "dpn-keycloak"
+
+  - name: KEYCLOAK_FULL_NAME
+    value: "dpn-keycloak"
+
+  - name: POSTGRES_FULL_NAME
+    value: "dpn-keycloak-postgres"
+
+  - name: KEYCLOAK_HTTPS_PORT
+    value: "8443"
+
+  - name: PARAMETERS_FILE
+    value: ".pipelines/azure-pipelines/config/${{ parameters.environment }}-${{ parameters.dpnCluster }}.json"
+
+  - name: VALUES_FILE
+    value: "charts/keycloak/values-${{ parameters.environment }}-${{ parameters.dpnCluster }}.yaml"
+
+  - ${{ if or(eq(parameters.environment, 'pdev'), eq(parameters.environment, 'ptest'), eq(parameters.environment, 'puat')) }}:
+    - name: APPROVAL_GROUP
+      value: dsi-ppd
+  - ${{ elseif or(eq(parameters.environment, 'devtest'), eq(parameters.environment, 'test')) }}:
+    - name: APPROVAL_GROUP
+      value: dsi-devtest
+  - ${{ else }}:
+    - name: APPROVAL_GROUP
+      value: dsi-dev
+
+# ============================================================
+# Stage 1 — Validate
+# ============================================================
+stages:
+
+- stage: Validate
+  displayName: "Validate"
+
+  jobs:
+  - job: Validate
+    displayName: "Key Vault Preflight + Helm Lint + Dry Run"
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+
+    steps:
+    - checkout: self
+
+    - script: |
+        echo "##[error]dpn02 is disabled for environment '${{ parameters.environment }}' — it has only a single DPN."
+        exit 1
+      displayName: "Block dpn02 for single-DPN environments"
+      condition: and(succeeded(), in('${{ parameters.environment }}', 'pdev', 'ptest', 'puat'), eq('${{ parameters.dpnCluster }}', 'dpn02'))
+
+    - script: |
+        echo "Loading config from: $(PARAMETERS_FILE)"
+        for param in $(jq -r 'keys_unsorted | .[]' "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)"); do
+          value=$(jq -r ".\"$param\"" "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)")
+          echo "##vso[task.setvariable variable=$param]$value"
+        done
+      displayName: "Load Environment Config"
+
+    - script: |
+        if [ ! -f "$(VALUES_FILE)" ]; then
+          echo "##[error]Values file not found: $(VALUES_FILE)"
+          exit 1
+        fi
+        if [ ! -f "$(CHART_DIR)/Chart.yaml" ]; then
+          echo "##[error]Chart.yaml not found: $(CHART_DIR)/Chart.yaml"
+          exit 1
+        fi
+        if [ ! -d "$(CHART_DIR)/templates" ]; then
+          echo "##[error]Templates directory not found: $(CHART_DIR)/templates"
+          exit 1
+        fi
+        echo "Chart and values file present."
+      displayName: "Check Chart + Values File Exist"
+
+    - task: AzureCLI@2
+      displayName: "Key Vault Secret Preflight"
+      inputs:
+        azureSubscription: "${{ parameters.ServiceConnection }}"
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+
+          az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+
+          echo " KEY VAULT PREFLIGHT — $(KEY_VAULT_NAME)"
+          echo "The chart mounts these via the AKV CSI driver. A missing secret"
+          echo "surfaces as an opaque pod mount failure, so fail here instead."
+          REQUIRED_SECRETS=$(helm template preflight $(CHART_DIR) -f $(VALUES_FILE) \
+            --show-only templates/secretproviderclass.yaml 2>/dev/null \
+            | sed -n '/objects: |/,/secretObjects:/p' \
+            | grep 'objectName:' | sed 's/.*objectName: //' | sort -u)
+
+          if [ -z "$REQUIRED_SECRETS" ]; then
+            echo "##[error]Could not determine required secrets from the chart."
+            exit 1
+          fi
+
+          MISSING=0
+          for SECRET in $REQUIRED_SECRETS; do
+            if az keyvault secret show \
+                 --vault-name "$(KEY_VAULT_NAME)" \
+                 --name "$SECRET" \
+                 --query id -o tsv >/dev/null 2>&1; then
+              echo "  [OK]      $SECRET"
+            else
+              echo "##[error]  [MISSING] $SECRET not found in $(KEY_VAULT_NAME)"
+              MISSING=1
+            fi
+          done
+
+          if [ "$MISSING" -ne 0 ]; then
+            echo "##[error]Load the missing secrets into $(KEY_VAULT_NAME) before deploying."
+            exit 1
+          fi
+
+          echo "All required Key Vault secrets are present."
+
+          # Not CSI-mounted, so absent from the secretproviderclass.yaml
+          # scrape above — fed to configure-keycloak.sh in the Deploy stage
+          # instead. Checked explicitly here so a missing value fails
+          # Validate rather than Deploy.
+          if az keyvault secret show \
+               --vault-name "$(KEY_VAULT_NAME)" \
+               --name KC-SERVICE-CLIENT-SECRET \
+               --query id -o tsv >/dev/null 2>&1; then
+            echo "  [OK]      KC-SERVICE-CLIENT-SECRET"
+          else
+            echo "##[error]  [MISSING] KC-SERVICE-CLIENT-SECRET not found in $(KEY_VAULT_NAME)"
+            echo "##[error]This must match the client-secret already handed out to"
+            echo "##[error]dpn-health-monitoring-service's oauth2-proxy/kafka-ui/airflow."
+            exit 1
+          fi
+
+          echo "The TLS keystore is verified against the cluster in the next step."
+
+    - task: AzureCLI@2
+      displayName: "AKS Auth + Helm Lint + Dry Run"
+      inputs:
+        azureSubscription: "${{ parameters.ServiceConnection }}"
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+
+          echo " INSTALL TOOLS"
+          which kubelogin >/dev/null 2>&1 || az aks install-cli --client-version v1.31.0 --kubelogin-version v0.1.4
+          kubelogin --version >/dev/null
+          helm version >/dev/null
+
+          echo " AKS AUTH"
+          az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+          az aks get-credentials \
+            --resource-group $(RESOURCE_GROUP) \
+            --name $(AKS_CLUSTER) \
+            --overwrite-existing
+          kubelogin convert-kubeconfig -l azurecli
+
+          echo " NAMESPACE CHECK"
+          kubectl get namespace $(NAMESPACE)
+
+          echo " TLS KEYSTORE SECRET CHECK"
+          TLS_SECRET=$(helm template preflight $(CHART_DIR) -f $(VALUES_FILE) \
+            --show-only templates/keycloak-deployment.yaml 2>/dev/null \
+            | awk '/name: keycloak-cert$/{f=1} f && /secretName:/{print $2; exit}')
+
+          if [ -z "$TLS_SECRET" ]; then
+            echo "##[error]Could not determine the TLS secret name from the chart."
+            exit 1
+          fi
+
+          echo "Chart mounts in-cluster secret: $TLS_SECRET"
+
+          if ! kubectl get secret "$TLS_SECRET" -n $(NAMESPACE) >/dev/null 2>&1; then
+            echo "##[error]Secret '$TLS_SECRET' not found in namespace $(NAMESPACE)."
+            exit 1
+          fi
+
+          CM=$(helm template preflight $(CHART_DIR) -f $(VALUES_FILE) \
+            --show-only templates/configmap.yaml 2>/dev/null)
+          MOUNT=$(helm template preflight $(CHART_DIR) -f $(VALUES_FILE) \
+            --show-only templates/keycloak-deployment.yaml 2>/dev/null \
+            | awk '/name: keycloak-cert$/{f=1} f && /mountPath:/{print $2; exit}')
+
+          for VAR in KC_HTTPS_KEY_STORE_FILE KC_HTTPS_TRUST_STORE_FILE; do
+            P=$(echo "$CM" | grep "^  $VAR:" | sed 's/.*: *//; s/"//g' || true)
+            [ -z "$P" ] && continue
+            KEY=$(basename "$P")
+            DIR=$(dirname "$P")
+
+            if [ "$DIR" != "$MOUNT" ]; then
+              echo "##[error]$VAR points at $DIR but the secret is mounted at $MOUNT."
+              exit 1
+            fi
+
+            ESCAPED=$(echo "$KEY" | sed 's/\./\\./g')
+            if kubectl get secret "$TLS_SECRET" -n $(NAMESPACE) \
+                 -o jsonpath="{.data.$ESCAPED}" | grep -q .; then
+              echo "  [OK]      $VAR -> $KEY present in $TLS_SECRET"
+            else
+              echo "##[error]  [MISSING] $VAR expects '$KEY', absent from '$TLS_SECRET'."
+              echo "##[error]Keys actually present:"
+              kubectl get secret "$TLS_SECRET" -n $(NAMESPACE) -o json \
+                | grep -oE '"[^"]+\.jks"|"tls\.(crt|key)"' | sort -u || true
+              exit 1
+            fi
+          done
+
+          ALIAS=$(echo "$CM" | grep '^  KC_HTTPS_KEY_ALIAS:' | sed 's/.*: *//; s/"//g' || true)
+
+          if [ -z "$ALIAS" ]; then
+            echo "##[warning]KC_HTTPS_KEY_ALIAS is not set. Keycloak will pick a key"
+            echo "##[warning]from the keystore itself, which is ambiguous if it holds"
+            echo "##[warning]more than one. Set it in $(VALUES_FILE)."
+          else
+            KS_PW=$(az keyvault secret show --vault-name "$(KEY_VAULT_NAME)" \
+              --name KC-HTTPS-KEY-STORE-PASSWORD --query value -o tsv)
+            echo "##vso[task.setvariable variable=KS_PW;issecret=true]$KS_PW"
+
+            KS_FILE="$(mktemp)"
+            kubectl get secret "$TLS_SECRET" -n $(NAMESPACE) \
+              -o jsonpath='{.data.keystore\.jks}' | base64 -d > "$KS_FILE"
+
+            echo "--- keystore contents ---"
+            keytool -list -keystore "$KS_FILE" -storepass "$KS_PW" 2>/dev/null \
+              | grep -E 'Your keystore contains|PrivateKeyEntry|trustedCertEntry' || true
+
+            if keytool -list -keystore "$KS_FILE" -storepass "$KS_PW" \
+                 -alias "$ALIAS" >/dev/null 2>&1; then
+              echo "Alias check passed: '$ALIAS' exists in keystore.jks"
+
+              echo "--- certificate for alias '$ALIAS' ---"
+              keytool -list -v -keystore "$KS_FILE" -storepass "$KS_PW" \
+                -alias "$ALIAS" 2>/dev/null \
+                | grep -E 'Owner:|Issuer:|Valid from:|DNSName:' || true
+
+              KC_HOST=$(echo "$CM" | grep '^  KC_HOSTNAME:' \
+                | sed 's|.*https://||; s|:[0-9]*"$||; s|"||g' || true)
+
+              if [ -z "$KC_HOST" ]; then
+                echo "KC_HOSTNAME is unset — Keycloak takes the hostname from the"
+                echo "request, so there is no fixed name to check the certificate against."
+              elif keytool -list -v -keystore "$KS_FILE" -storepass "$KS_PW" \
+                   -alias "$ALIAS" 2>/dev/null | grep -q "$KC_HOST"; then
+                echo "Keycloak will advertise hostname: $KC_HOST"
+                echo "SAN check passed: certificate covers $KC_HOST"
+              else
+                echo "##[warning]Certificate for '$ALIAS' does not appear to cover $KC_HOST."
+                echo "##[warning]Keycloak advertises that hostname in every issuer URL and"
+                echo "##[warning]redirect URI. Set config.KC_HOSTNAME in $(VALUES_FILE) to a"
+                echo "##[warning]name this certificate actually carries."
+              fi
+            else
+              echo "##[error]Alias '$ALIAS' not found in keystore.jks."
+              echo "##[error]Set config.KC_HTTPS_KEY_ALIAS in $(VALUES_FILE) to one listed above."
+              rm -f "$KS_FILE"
+              exit 1
+            fi
+
+            rm -f "$KS_FILE"
+          fi
+
+          echo " HELM LINT"
+          helm lint $(CHART_DIR) -f $(VALUES_FILE)
+
+          echo " HELM DRY RUN"
+          helm upgrade --install $(RELEASE_NAME) $(CHART_DIR) \
+            --namespace $(NAMESPACE) \
+            -f $(VALUES_FILE) \
+            --dry-run
+
+          echo "Validation passed"
+
+# ============================================================
+# Stage 2 — Deploy (gated on the environment's approver group)
+# ============================================================
+- stage: Deploy
+  displayName: "Deploy Keycloak"
+  dependsOn: Validate
+  condition: succeeded()
+
+  jobs:
+  - deployment: DeployKeycloak
+    displayName: "Helm Upgrade --install"
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+    environment: "$(APPROVAL_GROUP)"
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - script: |
+              for param in $(jq -r 'keys_unsorted | .[]' "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)"); do
+                value=$(jq -r ".\"$param\"" "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)")
+                echo "##vso[task.setvariable variable=$param]$value"
+              done
+            displayName: "Load Environment Config"
+
+          - task: AzureCLI@2
+            displayName: "Helm Deploy Keycloak"
+            inputs:
+              azureSubscription: "${{ parameters.ServiceConnection }}"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                which kubelogin >/dev/null 2>&1 || az aks install-cli --client-version v1.31.0 --kubelogin-version v0.1.4
+                kubelogin --version >/dev/null
+                helm version >/dev/null
+
+                az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+                az aks get-credentials \
+                  --resource-group $(RESOURCE_GROUP) \
+                  --name $(AKS_CLUSTER) \
+                  --overwrite-existing
+                kubelogin convert-kubeconfig -l azurecli
+
+                echo " SEED BASE IMAGES INTO ACR"
+                az acr import \
+                  --name $(CONTAINER_REGISTRY) \
+                  --source quay.io/keycloak/keycloak:26.3.2 \
+                  --image keycloak/keycloak:26.3.2 \
+                  --force
+
+                az acr import \
+                  --name $(CONTAINER_REGISTRY) \
+                  --source docker.io/library/postgres:16-alpine \
+                  --image postgres:16-alpine \
+                  --force
+
+                echo " DEPLOYING KEYCLOAK"
+                echo " Environment  : ${{ parameters.environment }}"
+                echo " Cluster      : ${{ parameters.dpnCluster }}"
+                echo " AKS          : $(AKS_CLUSTER)"
+                echo " Namespace    : $(NAMESPACE)"
+                echo " Release      : $(RELEASE_NAME)"
+                echo " Values file  : $(VALUES_FILE)"
+                echo " TLS          : standard one-way HTTPS (not mutual TLS)"
+                echo " Access       : internal load balancer + ClusterIP"
+
+                helm upgrade --install $(RELEASE_NAME) $(CHART_DIR) \
+                  --namespace $(NAMESPACE) \
+                  -f $(VALUES_FILE) \
+                  --wait \
+                  --timeout $(HELM_TIMEOUT)
+
+                echo " ROLLOUT STATUS"
+                kubectl rollout status deployment/$(POSTGRES_FULL_NAME) \
+                  -n $(NAMESPACE) --timeout=300s
+                kubectl rollout status statefulset/$(KEYCLOAK_FULL_NAME) \
+                  -n $(NAMESPACE) --timeout=600s
+
+                echo " POST-DEPLOY STATUS"
+                kubectl get pods -n $(NAMESPACE) -l app=$(KEYCLOAK_FULL_NAME) -o wide
+                kubectl get pods -n $(NAMESPACE) -l app=$(POSTGRES_FULL_NAME) -o wide
+                kubectl get svc  -n $(NAMESPACE) -l app.kubernetes.io/name=$(KEYCLOAK_FULL_NAME)
+
+                echo " CAPTURE DEPLOYED IMAGE DIGEST"
+                KEYCLOAK_DIGEST=$(kubectl get pods -n $(NAMESPACE) \
+                  -l app=$(KEYCLOAK_FULL_NAME) \
+                  -o jsonpath='{.items[0].status.containerStatuses[0].imageID}')
+
+                if [ -z "$KEYCLOAK_DIGEST" ]; then
+                  echo "##[error]Could not resolve deployed keycloak image digest from pod status"
+                  exit 1
+                fi
+
+                KEYCLOAK_IMAGE=$(kubectl get pods -n $(NAMESPACE) \
+                  -l app=$(KEYCLOAK_FULL_NAME) \
+                  -o jsonpath='{.items[0].spec.containers[0].image}')
+
+                echo "Keycloak image        : $KEYCLOAK_IMAGE"
+                echo "Keycloak image digest : $KEYCLOAK_DIGEST"
+
+                mkdir -p $(Build.ArtifactStagingDirectory)/deployed-digest
+
+                {
+                  echo "$KEYCLOAK_DIGEST"
+                  echo "component=keycloak"
+                  echo "environment=${{ parameters.environment }}"
+                  echo "dpnCluster=${{ parameters.dpnCluster }}"
+                  echo "image=$KEYCLOAK_IMAGE"
+                } > $(Build.ArtifactStagingDirectory)/deployed-digest/keycloak-digest.txt
+
+                echo "Digest written to artifact staging directory"
+                echo "Keycloak deployed successfully"
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish Deployed Image Digest"
+            inputs:
+              pathToPublish: "$(Build.ArtifactStagingDirectory)/deployed-digest"
+              artifactName: "deployed-image-digest"
+
+          - task: AzureCLI@2
+            displayName: "Configure Realm, Client, Roles and Audit Logging"
+            inputs:
+              azureSubscription: "${{ parameters.ServiceConnection }}"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+                az aks get-credentials \
+                  --resource-group $(RESOURCE_GROUP) \
+                  --name $(AKS_CLUSTER) \
+                  --overwrite-existing
+                kubelogin convert-kubeconfig -l azurecli
+
+                KC_ADMIN_PASSWORD=$(az keyvault secret show \
+                  --vault-name "$(KEY_VAULT_NAME)" \
+                  --name KEYCLOAK-ADMIN-PASSWORD \
+                  --query value -o tsv)
+                echo "##vso[task.setvariable variable=KC_ADMIN_PASSWORD;issecret=true]$KC_ADMIN_PASSWORD"
+                export KC_ADMIN_PASSWORD
+
+                # KC-SERVICE-CLIENT-SECRET must match whatever
+                # dpn-health-monitoring-service's oauth2-proxy/kafka-ui/airflow
+                # already use to authenticate against "dpn-service-client".
+                KC_SERVICE_CLIENT_SECRET=$(az keyvault secret show \
+                  --vault-name "$(KEY_VAULT_NAME)" \
+                  --name KC-SERVICE-CLIENT-SECRET \
+                  --query value -o tsv)
+                echo "##vso[task.setvariable variable=KC_SERVICE_CLIENT_SECRET;issecret=true]$KC_SERVICE_CLIENT_SECRET"
+                export KC_SERVICE_CLIENT_SECRET
+
+                export KC_BASE_URL="$(KEYCLOAK_BASE_URL)"
+
+                # The agent sits outside the cluster and the service is on an
+                # internal LB, so tunnel to the ClusterIP for the duration. The
+                # local port is taken from KEYCLOAK_BASE_URL so the two cannot
+                # drift apart.
+                PF_PORT=$(printf '%s' "$KC_BASE_URL" | sed 's|.*:||')
+                kubectl port-forward -n $(NAMESPACE) \
+                  svc/$(KEYCLOAK_FULL_NAME) "${PF_PORT}:$(KEYCLOAK_HTTPS_PORT)" >/dev/null 2>&1 &
+                PF_PID=$!
+                trap 'kill "$PF_PID" 2>/dev/null || true' EXIT
+
+                for _ in $(seq 1 30); do
+                  if curl -sk --max-time 2 -o /dev/null \
+                       "${KC_BASE_URL}/realms/master"; then
+                    break
+                  fi
+                  sleep 2
+                done
+
+                export KC_ADMIN_USER="$(KEYCLOAK_ADMIN_USER)"
+                export KC_REALM="$(KEYCLOAK_REALM)"
+                export KC_CLIENT_ID="$(KEYCLOAK_CLIENT_ID)"
+
+                bash $(CHART_DIR)/scripts/configure-keycloak.sh
+
+# ============================================================
+# Stage 3 — Verify
+# ============================================================
+- stage: Verify
+  displayName: "Verify Keycloak [${{ parameters.environment }}-${{ parameters.dpnCluster }}]"
+  dependsOn: Deploy
+  condition: succeeded()
+
+  jobs:
+  - job: Verify
+    displayName: "Keycloak HTTPS Health Check"
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+
+    steps:
+    - checkout: self
+
+    - script: |
+        for param in $(jq -r 'keys_unsorted | .[]' "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)"); do
+          value=$(jq -r ".\"$param\"" "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)")
+          echo "##vso[task.setvariable variable=$param]$value"
+        done
+      displayName: "Load Environment Config"
+
+    - task: AzureCLI@2
+      displayName: "Pod / Service / Internal LB / HTTPS Checks"
+      inputs:
+        azureSubscription: "${{ parameters.ServiceConnection }}"
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+
+          which kubelogin >/dev/null 2>&1 || az aks install-cli --client-version v1.31.0 --kubelogin-version v0.1.4
+          az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+          az aks get-credentials \
+            --resource-group $(RESOURCE_GROUP) \
+            --name $(AKS_CLUSTER) \
+            --overwrite-existing
+          kubelogin convert-kubeconfig -l azurecli
+
+          echo " POD STATUS"
+          kubectl get pods -n $(NAMESPACE) -l app=$(KEYCLOAK_FULL_NAME) -o wide
+          kubectl get pods -n $(NAMESPACE) -l app=$(POSTGRES_FULL_NAME) -o wide
+
+          echo " SERVICE STATUS"
+          kubectl get svc -n $(NAMESPACE) -l app.kubernetes.io/name=$(KEYCLOAK_FULL_NAME)
+
+          echo " INTERNAL LOAD BALANCER"
+          LB_IP=$(kubectl get svc $(KEYCLOAK_FULL_NAME)-service-lb -n $(NAMESPACE) \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+
+          if [ -z "$LB_IP" ]; then
+            echo "##[error]Internal load balancer has no assigned IP yet."
+            kubectl describe svc $(KEYCLOAK_FULL_NAME)-service-lb -n $(NAMESPACE) || true
+            exit 1
+          fi
+
+          echo "Internal LB IP : $LB_IP"
+          echo "Internal URL   : https://$LB_IP:$(KEYCLOAK_HTTPS_PORT)"
+          echo "In-cluster URL : https://$(KEYCLOAK_FULL_NAME).$(NAMESPACE).svc.cluster.local:$(KEYCLOAK_HTTPS_PORT)"
+
+          INTERNAL_ANNOTATION=$(kubectl get svc $(KEYCLOAK_FULL_NAME)-service-lb -n $(NAMESPACE) \
+            -o jsonpath='{.metadata.annotations.service\.beta\.kubernetes\.io/azure-load-balancer-internal}')
+
+          if [ "$INTERNAL_ANNOTATION" != "true" ]; then
+            echo "##[error]Load balancer is NOT marked internal — refusing to pass verification."
+            exit 1
+          fi
+          echo "Confirmed: load balancer is internal."
+
+          echo " HTTPS ENDPOINT CHECK (in-cluster)"
+          kubectl run keycloak-curl-test-$RANDOM \
+            -n $(NAMESPACE) \
+            --image=curlimages/curl:8.8.0 \
+            --restart=Never \
+            --rm \
+            --attach \
+            --command -- sh -c \
+            "curl -sS -k -o /dev/null -w 'HTTP %{http_code} via TLS %{ssl_verify_result}\n' --max-time 20 https://$(KEYCLOAK_FULL_NAME).$(NAMESPACE).svc.cluster.local:$(KEYCLOAK_HTTPS_PORT)/realms/master || true"
+
+          echo " PLAINTEXT MUST BE REFUSED"
+          # KC_HTTP_ENABLED=false — nothing should answer on 8080.
+          kubectl run keycloak-http-test-$RANDOM \
+            -n $(NAMESPACE) \
+            --image=curlimages/curl:8.8.0 \
+            --restart=Never \
+            --rm \
+            --attach \
+            --command -- sh -c \
+            "curl -sS -o /dev/null --max-time 10 http://$(KEYCLOAK_FULL_NAME).$(NAMESPACE).svc.cluster.local:8080/ && echo 'UNEXPECTED: plaintext HTTP answered' || echo 'Expected: plaintext HTTP refused'"
+
+          echo " KEYCLOAK LOGS (tail)"
+          kubectl logs -n $(NAMESPACE) -l app=$(KEYCLOAK_FULL_NAME) --tail=100 || true
+
+          echo "Verification complete"

@@ -1,0 +1,474 @@
+name: DPN CD - Keycloak
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Select Environment"
+        required: true
+        default: "test"
+        type: choice
+        options:
+          - dev
+          - test
+
+      cluster:
+        description: "Target DPN Cluster"
+        required: true
+        default: "dpn01"
+        type: choice
+        options:
+          - dpn01
+          - dpn02
+
+      cloud:
+        description: "Target Cloud Provider"
+        required: true
+        default: "aws"
+        type: choice
+        options:
+          - azure
+          - aws
+          - gcp
+
+      keycloakImageRepository:
+        description: "Keycloak image path AFTER <<your specific value>>/ (e.g. 1.0.1/keycloak) — leave blank to use the environment's configured repository"
+        required: false
+        default: ""
+        type: string
+
+      keycloakImageTag:
+        description: "Keycloak image tag (leave blank to use the environment's configured tag)"
+        required: false
+        default: ""
+        type: string
+
+      postgresImageRepository:
+        description: "Keycloak Postgres image path AFTER <<your specific value>>/ (e.g. 1.0.1/postgres) — leave blank to use the environment's configured repository"
+        required: false
+        default: ""
+        type: string
+
+      postgresImageTag:
+        description: "Keycloak Postgres image tag (leave blank to use the environment's configured tag)"
+        required: false
+        default: ""
+        type: string
+
+env:
+  PARAMETERS_FILE: .github/config/${{ inputs.cloud }}/${{ inputs.environment }}-${{ inputs.cluster }}.json
+  CHART_DIR: dpn-authentication-service/charts/keycloak
+  RELEASE_NAME: dpn-keycloak
+  KEYCLOAK_FULL_NAME: dpn-keycloak
+  POSTGRES_FULL_NAME: dpn-keycloak-postgres
+  VALUES_FILE: dpn-authentication-service/charts/keycloak/values/${{ inputs.cloud }}/${{ inputs.environment }}-${{ inputs.cluster }}.yaml
+  HUB_ROLE_ARN: <<your specific value>>
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Helm Deploy
+    runs-on: [self-hosted, vmss]
+    environment: ${{ inputs.environment }}-${{ inputs.cluster }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Applied Parameters
+        shell: bash
+        run: |
+          echo "environment=${{ inputs.environment }}"
+          echo "cluster=${{ inputs.cluster }}"
+          echo "cloud=${{ inputs.cloud }}"
+          echo "keycloakImageRepository=${{ inputs.keycloakImageRepository }}"
+          echo "keycloakImageTag=${{ inputs.keycloakImageTag }}"
+          echo "postgresImageRepository=${{ inputs.postgresImageRepository }}"
+          echo "postgresImageTag=${{ inputs.postgresImageTag }}"
+
+      - name: Read Deployment Config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "${PARAMETERS_FILE}" ]; then
+            echo "ERROR: ${PARAMETERS_FILE} not found!"
+            exit 1
+          fi
+
+          echo "Loading config from ${PARAMETERS_FILE}"
+          for key in $(jq -r 'keys_unsorted[]' "${PARAMETERS_FILE}"); do
+            value=$(jq -r ".\"$key\"" "${PARAMETERS_FILE}")
+            echo "${key}=${value}" >> "$GITHUB_ENV"
+            echo "Set ${key}"
+          done
+
+      - name: Cloud Login
+        uses: ./.github/actions/cloud-login
+        with:
+          cloud: ${{ inputs.cloud }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          aws-region: ${{ env.AWS_REGION }}
+          aws-account-id: ${{ env.AWS_ACCOUNT_ID }}
+          eks-cluster: ${{ env.EKS_CLUSTER }}
+
+      ###################################################################
+      # SECRETS PREFLIGHT
+      # The chart mounts these via the Secrets Store CSI driver (AKV on
+      # Azure, Secrets Manager on AWS). A missing secret surfaces as an
+      # opaque pod mount failure, so fail here instead.
+      ###################################################################
+      - name: Key Vault Secret Preflight
+        if: ${{ inputs.cloud == 'azure' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "KEY VAULT PREFLIGHT — $KEY_VAULT_NAME"
+          REQUIRED_SECRETS=$(helm template preflight "$CHART_DIR" -f "$VALUES_FILE" \
+            --show-only templates/secretproviderclass.yaml 2>/dev/null \
+            | sed -n '/objects: |/,/secretObjects:/p' \
+            | grep 'objectName:' | sed 's/.*objectName: //' | sort -u)
+
+          if [ -z "$REQUIRED_SECRETS" ]; then
+            echo "::error::Could not determine required secrets from the chart."
+            exit 1
+          fi
+
+          MISSING=0
+          for SECRET in $REQUIRED_SECRETS; do
+            if az keyvault secret show \
+                 --vault-name "$KEY_VAULT_NAME" \
+                 --name "$SECRET" \
+                 --query id -o tsv >/dev/null 2>&1; then
+              echo "  [OK]      $SECRET"
+            else
+              echo "::error::  [MISSING] $SECRET not found in $KEY_VAULT_NAME"
+              MISSING=1
+            fi
+          done
+
+          # Not CSI-mounted, so absent from the secretproviderclass.yaml
+          # scrape above — fetched explicitly later and passed to
+          # configure-keycloak.sh instead. Checked here so a missing value
+          # fails fast rather than mid-deploy.
+          for SECRET in KC-SERVICE-CLIENT-SECRET; do
+            if az keyvault secret show \
+                 --vault-name "$KEY_VAULT_NAME" \
+                 --name "$SECRET" \
+                 --query id -o tsv >/dev/null 2>&1; then
+              echo "  [OK]      $SECRET"
+            else
+              echo "::error::  [MISSING] $SECRET not found in $KEY_VAULT_NAME"
+              echo "::error::This must match the client-secret already handed out to"
+              echo "::error::dpn-health-monitoring-service's oauth2-proxy sidecars."
+              MISSING=1
+            fi
+          done
+
+          if [ "$MISSING" -ne 0 ]; then
+            echo "::error::Load the missing secrets into $KEY_VAULT_NAME before deploying."
+            exit 1
+          fi
+
+          echo "All required Key Vault secrets are present."
+
+      ###################################################################
+      # HELM LINT + DRY RUN
+      ###################################################################
+      - name: Helm Lint + Dry Run
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXTRA_ARGS=()
+          if [ -n "${{ inputs.keycloakImageRepository }}" ]; then
+            EXTRA_ARGS+=(--set image.repository="<<your specific value>>/${{ inputs.keycloakImageRepository }}")
+          fi
+          if [ -n "${{ inputs.keycloakImageTag }}" ]; then
+            EXTRA_ARGS+=(--set image.tag="${{ inputs.keycloakImageTag }}")
+          fi
+          if [ -n "${{ inputs.postgresImageRepository }}" ]; then
+            EXTRA_ARGS+=(--set postgres.image.repository="<<your specific value>>/${{ inputs.postgresImageRepository }}")
+          fi
+          if [ -n "${{ inputs.postgresImageTag }}" ]; then
+            EXTRA_ARGS+=(--set postgres.image.tag="${{ inputs.postgresImageTag }}")
+          fi
+
+          helm lint "$CHART_DIR" -f "$VALUES_FILE" "${EXTRA_ARGS[@]}"
+
+          helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
+            --namespace "$NAMESPACE" \
+            -f "$VALUES_FILE" \
+            "${EXTRA_ARGS[@]}" \
+            --dry-run
+
+          echo "Validation passed"
+
+      ###################################################################
+      # HELM DEPLOY
+      ###################################################################
+      - name: Helm Deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # NOTE: no --wait/--timeout here. Long-lived watches against the EKS
+          # API from this runner are unreliable and time out ("context deadline
+          # exceeded") even when the rollout completes successfully on the
+          # cluster. Short-lived calls are fine, so: fire the upgrade without
+          # waiting, then poll readiness with a short per-attempt timeout and
+          # a few retries instead.
+          EXTRA_ARGS=()
+          if [ -n "${{ inputs.keycloakImageRepository }}" ]; then
+            EXTRA_ARGS+=(--set image.repository="<<your specific value>>/${{ inputs.keycloakImageRepository }}")
+          fi
+          if [ -n "${{ inputs.keycloakImageTag }}" ]; then
+            EXTRA_ARGS+=(--set image.tag="${{ inputs.keycloakImageTag }}")
+          fi
+          if [ -n "${{ inputs.postgresImageRepository }}" ]; then
+            EXTRA_ARGS+=(--set postgres.image.repository="<<your specific value>>/${{ inputs.postgresImageRepository }}")
+          fi
+          if [ -n "${{ inputs.postgresImageTag }}" ]; then
+            EXTRA_ARGS+=(--set postgres.image.tag="${{ inputs.postgresImageTag }}")
+          fi
+
+          if ! helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
+            --namespace "$NAMESPACE" \
+            -f "$VALUES_FILE" \
+            "${EXTRA_ARGS[@]}"; then
+            echo "::error::Helm Deploy (helm upgrade --install) failed."
+
+            echo "::group::DEBUG - helm status"
+            helm status "$RELEASE_NAME" -n "$NAMESPACE" || true
+            echo "::endgroup::"
+
+            exit 1
+          fi
+
+          echo "Helm upgrade call succeeded — polling rollout status separately..."
+
+          # postgres is a Deployment; keycloak itself is a StatefulSet (per-replica
+          # PVCs for HA, see keycloak-deployment.yaml) -- each needs its own kind.
+          for target_pair in "$POSTGRES_FULL_NAME:deployment" "$KEYCLOAK_FULL_NAME:statefulset"; do
+            target="${target_pair%%:*}"
+            kind="${target_pair##*:}"
+            ROLLOUT_OK=false
+            for attempt in 1 2 3 4 5; do
+              if kubectl rollout status "$kind"/"$target" -n "$NAMESPACE" --timeout=60s; then
+                ROLLOUT_OK=true
+                break
+              fi
+              echo "Rollout status attempt $attempt/5 for $target did not complete within 60s — retrying..."
+              sleep 10
+            done
+
+            if [ "$ROLLOUT_OK" != "true" ]; then
+              echo "::error::Deployment $target did not report ready after 5 attempts."
+
+              echo "::group::DEBUG - helm status"
+              helm status "$RELEASE_NAME" -n "$NAMESPACE" || true
+              echo "::endgroup::"
+
+              echo "::group::DEBUG - pod describe ($target)"
+              kubectl describe pods -n "$NAMESPACE" -l app="$target" || true
+              echo "::endgroup::"
+
+              echo "::group::DEBUG - PVCs"
+              kubectl get pvc -n "$NAMESPACE" || true
+              kubectl describe pvc -n "$NAMESPACE" || true
+              echo "::endgroup::"
+
+              echo "::group::DEBUG - SecretProviderClass"
+              kubectl get secretproviderclass -n "$NAMESPACE" || true
+              kubectl describe secretproviderclass -n "$NAMESPACE" dpn-keycloak-kv-secrets || true
+              echo "::endgroup::"
+
+              echo "::group::DEBUG - namespace events (most recent 50)"
+              kubectl get events -n "$NAMESPACE" --sort-by='.lastTimestamp' | tail -n 50 || true
+              echo "::endgroup::"
+
+              exit 1
+            fi
+          done
+
+          echo "========================================"
+          echo "POST-DEPLOY STATUS"
+          echo "========================================"
+          kubectl get pods -n "$NAMESPACE" -l app="$KEYCLOAK_FULL_NAME" -o wide
+          kubectl get pods -n "$NAMESPACE" -l app="$POSTGRES_FULL_NAME" -o wide
+
+      ###################################################################
+      # CONFIGURE REALM, CLIENT, ROLES AND AUDIT LOGGING
+      # Realm/client names are left at configure-keycloak.sh's own defaults
+      # (KC_REALM=dpn-realm, KC_CLIENT_ID=DPN-Client, KC_UI_CLIENT_ID=
+      # dpn-service-client) — these are the values already live, confirmed
+      # against dpn-authentication-service's own ADO config and
+      # dpn-health-monitoring-service's oauth2-proxy client configuration.
+      ###################################################################
+      - name: Configure Realm, Client, Roles and Audit Logging
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ inputs.cloud }}" = "aws" ]; then
+            SECRET_PREFIX="dpn/${{ inputs.environment }}-${{ inputs.cluster }}/keycloak"
+
+            KC_ADMIN_PASSWORD=$(aws secretsmanager get-secret-value \
+              --secret-id "$SECRET_PREFIX/KEYCLOAK_ADMIN_PASSWORD" \
+              --query SecretString --output text)
+            echo "::add-mask::$KC_ADMIN_PASSWORD"
+            export KC_ADMIN_PASSWORD
+
+            # Must match whatever dpn-health-monitoring-service's oauth2-proxy
+            # sidecars already use to authenticate against dpn-service-client —
+            # asserted on every run so it can never drift to a
+            # Keycloak-generated random value.
+            KC_SERVICE_CLIENT_SECRET=$(aws secretsmanager get-secret-value \
+              --secret-id "$SECRET_PREFIX/KC_SERVICE_CLIENT_SECRET" \
+              --query SecretString --output text)
+            echo "::add-mask::$KC_SERVICE_CLIENT_SECRET"
+            export KC_SERVICE_CLIENT_SECRET
+          else
+            KC_ADMIN_PASSWORD=$(az keyvault secret show \
+              --vault-name "$KEY_VAULT_NAME" \
+              --name KEYCLOAK-ADMIN-PASSWORD \
+              --query value -o tsv)
+            echo "::add-mask::$KC_ADMIN_PASSWORD"
+            export KC_ADMIN_PASSWORD
+
+            # Must match whatever dpn-health-monitoring-service's oauth2-proxy
+            # sidecars already use to authenticate against dpn-service-client —
+            # asserted on every run so it can never drift to a
+            # Keycloak-generated random value.
+            KC_SERVICE_CLIENT_SECRET=$(az keyvault secret show \
+              --vault-name "$KEY_VAULT_NAME" \
+              --name KC-SERVICE-CLIENT-SECRET \
+              --query value -o tsv)
+            echo "::add-mask::$KC_SERVICE_CLIENT_SECRET"
+            export KC_SERVICE_CLIENT_SECRET
+          fi
+
+          export KC_BASE_URL="https://127.0.0.1:18443"
+
+          # The runner sits outside the cluster and the service is on an
+          # internal LB, so tunnel to the ClusterIP for the duration.
+          kubectl port-forward -n "$NAMESPACE" \
+            svc/"$KEYCLOAK_FULL_NAME" 18443:8443 >/dev/null 2>&1 &
+          PF_PID=$!
+          trap 'kill "$PF_PID" 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 30); do
+            if curl -sk --max-time 2 -o /dev/null "${KC_BASE_URL}/realms/master"; then
+              break
+            fi
+            sleep 2
+          done
+
+          export KC_ADMIN_USER="admin"
+
+          # configure-keycloak.sh registers each UI's redirect URIs on the
+          # shared dpn-service-client. Without these, every KC_UI_HOST_*
+          # defaults to an unreachable internal placeholder
+          # (dpn-observability.ns-dpn-health-01.svc.cluster.local:<port>),
+          # so Keycloak rejects every real login with "Invalid parameter:
+          # redirect_uri" -- confirmed live on dev-dpn02 2026-09-17. Look up
+          # each UI's real LoadBalancer hostname now; skip (leave the script's
+          # own placeholder default) for any not yet deployed/pending, rather
+          # than failing this step entirely.
+          lookup_lb_host() {
+            local svc="$1" ns="$2"
+            kubectl get svc "$svc" -n "$ns" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true
+          }
+
+          if [ "${{ inputs.cloud }}" = "aws" ]; then
+            HOST="$(lookup_lb_host dpn-airflow-webserver-external ns-dpn-01)"
+            # Airflow's own LoadBalancer now terminates real HTTPS on 8080
+            # (previously plain HTTP on port 80, no port needed in the URL --
+            # confirmed live 2026-09-21 after the airflow-lb.yaml/
+            # airflow-webserver.yaml chart change added TLS termination).
+            [ -n "$HOST" ] && export KC_UI_HOST_AIRFLOW="$HOST:8080"
+
+            HOST="$(lookup_lb_host dpn-oauth2-proxy-jaeger ns-dpn-health-01)"
+            [ -n "$HOST" ] && export KC_UI_HOST_JAEGER="$HOST:16686"
+
+            HOST="$(lookup_lb_host dpn-oauth2-proxy-osd ns-dpn-health-01)"
+            [ -n "$HOST" ] && export KC_UI_HOST_OPENSEARCH_DASHBOARDS="$HOST:5601"
+
+            HOST="$(lookup_lb_host dpn-oauth2-proxy-perses ns-dpn-health-01)"
+            [ -n "$HOST" ] && export KC_UI_HOST_PERSES="$HOST:8083"
+
+            HOST="$(lookup_lb_host dpn-oauth2-proxy-portal ns-dpn-health-01)"
+            [ -n "$HOST" ] && export KC_UI_HOST_PORTAL="$HOST:8443"
+
+            HOST="$(lookup_lb_host dpn-kafka-health-ui ns-dpn-health-01)"
+            [ -n "$HOST" ] && export KC_UI_HOST_KAFKA_UI="$HOST:8082"
+
+            HOST="$(lookup_lb_host dpn-kafka-ui-external ns-dpn-01)"
+            [ -n "$HOST" ] && export KC_UI_HOST_KAFKA_UI_2="$HOST:8086"
+
+            HOST="$(lookup_lb_host dpn-federator-client-1-external ns-dpn-01)"
+            [ -n "$HOST" ] && export KC_UI_HOST_FEDERATOR_CLIENT_1="$HOST:8085"
+
+            HOST="$(lookup_lb_host dpn-federator-client-2-external ns-dpn-01)"
+            [ -n "$HOST" ] && export KC_UI_HOST_FEDERATOR_CLIENT_2="$HOST:8085"
+
+            echo "Resolved KC_UI_HOST_* overrides (blank = chart not deployed yet, script default applies):"
+            echo "  AIRFLOW=${KC_UI_HOST_AIRFLOW:-<default>}"
+            echo "  JAEGER=${KC_UI_HOST_JAEGER:-<default>}"
+            echo "  OPENSEARCH_DASHBOARDS=${KC_UI_HOST_OPENSEARCH_DASHBOARDS:-<default>}"
+            echo "  PERSES=${KC_UI_HOST_PERSES:-<default>}"
+            echo "  PORTAL=${KC_UI_HOST_PORTAL:-<default>}"
+            echo "  KAFKA_UI=${KC_UI_HOST_KAFKA_UI:-<default>}"
+            echo "  KAFKA_UI_2=${KC_UI_HOST_KAFKA_UI_2:-<default>}"
+            echo "  FEDERATOR_CLIENT_1=${KC_UI_HOST_FEDERATOR_CLIENT_1:-<default>}"
+            echo "  FEDERATOR_CLIENT_2=${KC_UI_HOST_FEDERATOR_CLIENT_2:-<default>}"
+          fi
+
+          bash "$CHART_DIR/scripts/configure-keycloak.sh"
+
+      ###################################################################
+      # CAPTURE DEPLOYED IMAGE DIGEST
+      ###################################################################
+      - name: Capture Deployed Image Digest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          KEYCLOAK_DIGEST=$(kubectl get pods -n "$NAMESPACE" \
+            -l app="$KEYCLOAK_FULL_NAME" \
+            -o jsonpath='{.items[0].status.containerStatuses[0].imageID}')
+
+          if [ -z "$KEYCLOAK_DIGEST" ]; then
+            echo "::error::Could not resolve deployed keycloak image digest from pod status"
+            exit 1
+          fi
+
+          KEYCLOAK_IMAGE=$(kubectl get pods -n "$NAMESPACE" \
+            -l app="$KEYCLOAK_FULL_NAME" \
+            -o jsonpath='{.items[0].spec.containers[0].image}')
+
+          echo "Keycloak image: $KEYCLOAK_IMAGE"
+          echo "Keycloak image digest: $KEYCLOAK_DIGEST"
+
+          mkdir -p "$GITHUB_WORKSPACE/deployed-digest"
+
+          {
+            echo "$KEYCLOAK_DIGEST"
+            echo "component=keycloak"
+            echo "environment=${{ inputs.environment }}"
+            echo "dpncluster=${{ inputs.cluster }}"
+            echo "image=$KEYCLOAK_IMAGE"
+          } > "$GITHUB_WORKSPACE/deployed-digest/keycloak-digest.txt"
+
+          echo "Digest written to $GITHUB_WORKSPACE/deployed-digest"
+
+      - name: Publish Deployed Image Digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployed-image-digest
+          path: deployed-digest/

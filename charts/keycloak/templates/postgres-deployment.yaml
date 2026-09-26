@@ -1,0 +1,101 @@
+{{- if .Values.postgres.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.postgres.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "keycloak.postgres.selectorLabels" . | nindent 4 }}
+    {{- include "keycloak.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "keycloak.postgres.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "keycloak.postgres.selectorLabels" . | nindent 8 }}
+        {{- include "keycloak.labels" . | nindent 8 }}
+        {{- range $k, $v := .Values.serviceAccount.podLabels }}
+        {{ $k }}: {{ $v | quote }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "keycloak.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+
+      securityContext:
+        fsGroup: {{ .Values.postgres.fsGroup }}
+        runAsUser: {{ .Values.postgres.runAsUser }}
+        runAsGroup: {{ .Values.postgres.runAsGroup }}
+        runAsNonRoot: true
+
+      containers:
+        - name: postgres
+          image: "{{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}"
+          imagePullPolicy: {{ .Values.postgres.image.pullPolicy }}
+
+          ports:
+            - name: postgres
+              containerPort: {{ .Values.postgres.port }}
+              protocol: TCP
+
+          env:
+            - name: POSTGRES_DB
+              value: {{ .Values.postgres.database | quote }}
+            - name: POSTGRES_USER
+              value: {{ .Values.postgres.username | quote }}
+            - name: POSTGRES_PASSWORD_FILE
+              value: "/mnt/keyvault/{{ .Values.keyvault.secrets.dbPassword }}"
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - exec pg_isready -U {{ .Values.postgres.username }} -d {{ .Values.postgres.database }} -h 127.0.0.1
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
+
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - exec pg_isready -U {{ .Values.postgres.username }} -d {{ .Values.postgres.database }} -h 127.0.0.1
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 6
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+
+          resources:
+            {{- toYaml .Values.postgres.resources | nindent 12 }}
+
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+            - name: keyvault-secrets
+              mountPath: /mnt/keyvault
+              readOnly: true
+
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: {{ .Values.postgres.name }}-data
+        - name: keyvault-secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ include "keycloak.secretProviderClassName" . }}
+{{- end }}

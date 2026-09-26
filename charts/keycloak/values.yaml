@@ -1,0 +1,178 @@
+# =============================================================
+# Default values for the Keycloak Helm chart
+# Override per environment using values-<env>-<cluster>.yaml
+# Secrets are pulled from Azure Key Vault via SecretProviderClass
+# =============================================================
+
+fullnameOverride: "dpn-keycloak"
+namespace: "ns-dpn-01"
+
+image:
+  repository: ""
+  tag: "26.3.2"
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+# -- Horizontal Pod Autoscaler (templates/hpa.yaml). Disabled by default;
+#    turned on per-environment via values-<env>-<cluster>.yaml, same min/max/
+#    utilization pattern as dpn-federator-gateway's HPAs. Safe to scale past
+#    1 replica because keycloak-deployment.yaml is a StatefulSet — every
+#    replica gets its own PersistentVolumeClaim (see volumeClaimTemplates
+#    there), so nothing is shared between instances except the one Postgres
+#    database every replica already points at.
+hpa:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  cpuUtilization: 80
+  memoryUtilization: 80
+  scaleStep: 1
+
+# -- Pre-existing secret holding keystore.jks and truststore.jks, mounted at
+#    /cert. Not a kubernetes.io/tls secret — Keycloak reads the Java keystore
+#    directly via KC_HTTPS_KEY_STORE_FILE.
+tlsSecretName: "dpn-tls"
+tlsMountPath: "/cert"
+
+# -- Keycloak ConfigMap settings (non-secret KC_* options)
+config:
+  KC_DB: postgres
+  KC_DB_URL: "jdbc:postgresql://dpn-keycloak-postgres:5432/keycloak_db"
+  KC_DB_USERNAME: keycloak_db_user
+  KEYCLOAK_ADMIN: admin
+
+  # Hostname / Network
+  KC_HOSTNAME: "https://dpn-keycloak.ns-dpn-01.svc.cluster.local:8443"
+  KC_HOSTNAME_ADMIN: ""
+  # Leave true wherever KC_HOSTNAME is pinned. Set false, with KC_HOSTNAME
+  # empty, to let Keycloak take the hostname from the incoming request so it
+  # can be reached on several addresses.
+  KC_HOSTNAME_STRICT: "true"
+  KC_HOSTNAME_STRICT_HTTPS: "false"
+
+  # HTTP / HTTPS — HTTPS only, standard one-way TLS
+  KC_HTTP_ENABLED: "false"
+  KC_HTTPS_ENABLED: "true"
+  KC_HTTPS_PORT: "8443"
+  # request = mTLS, none = no client certificate. This deployment is NOT mTLS.
+  KC_HTTPS_CLIENT_AUTH: none
+  # Alias of the server key inside keystore.jks. Must match, or Keycloak fails
+  # to start. Check with:
+  #   keytool -list -keystore keystore.jks -storepass <pw>
+  KC_HTTPS_KEY_ALIAS: ""
+  KC_HTTPS_KEY_STORE_FILE: /cert/keystore.jks
+  KC_HTTPS_TRUST_STORE_FILE: /cert/truststore.jks
+
+  # Health & Logging
+  KC_HEALTH_ENABLED: "true"
+  KC_LOG_LEVEL: info
+
+# -- Bundled PostgreSQL. Set enabled: false and point config.KC_DB_URL at an
+#    external server to use a managed database instead.
+postgres:
+  enabled: true
+  name: "dpn-keycloak-postgres"
+  image:
+    repository: ""
+    tag: "16-alpine"
+    pullPolicy: IfNotPresent
+  database: "keycloak_db"
+  username: "keycloak_db_user"
+  port: 5432
+  # Data volume ownership — 70 on -alpine, 999 on Debian variants. The
+  # container also runs as that user: the entrypoint would otherwise start as
+  # root and chown the data directory, which capabilities.drop: ALL blocks.
+  fsGroup: 70
+  runAsUser: 70
+  runAsGroup: 70
+  persistence:
+    size: 8Gi
+    storageClassName: default
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+
+service:
+  clusterIP:
+    enabled: true
+    port: 8443
+  loadBalancer:
+    enabled: true
+    port: 8443
+    # Leave empty to let Azure auto-assign from the subnet.
+    loadBalancerIP: <<your specific value>>
+
+# -- Service account for the Keycloak and PostgreSQL pods
+serviceAccount:
+  create: true
+  name: ""
+  automountServiceAccountToken: false
+  annotations: {}
+  podLabels: {}
+
+# -- Azure Key Vault. These secrets must exist:
+#      KC-DB-PASSWORD
+#      KEYCLOAK-ADMIN-PASSWORD
+#      KC-SERVICE-CLIENT-SECRET (dpn-service-client's client secret, asserted onto
+#        that client by configure-keycloak.sh on every deploy; republished here as
+#        dpn-keycloak-secrets/KC_SERVICE_CLIENT_SECRET so Kafka/federator-client/
+#        federator-server/Airflow in this namespace can reference it directly
+#        instead of each pulling their own copy from Key Vault)
+# KEYSTORE-PASSWORD / TRUSTSTORE-PASSWORD are no longer pulled here — Keycloak
+# now reads KC_HTTPS_KEY_STORE_PASSWORD / KC_HTTPS_TRUST_STORE_PASSWORD from
+# the shared tls-auth-secret (created once by dpn-tls-cd) instead.
+keyvault:
+  tenantId: "<<your specific value>>"
+  name: ""
+  clientID: ""
+  secrets:
+    dbPassword: "KC-DB-PASSWORD"
+    adminPassword: "KEYCLOAK-ADMIN-PASSWORD"
+    serviceClientSecret: "KC-SERVICE-CLIENT-SECRET"
+
+# -- Pod-level security context for Keycloak. The official image runs as uid
+#    1000, so the data PVC has to be group-owned by it or the server cannot
+#    write to /opt/keycloak/data.
+podSecurityContext:
+  fsGroup: 1000
+  runAsUser: 1000
+  runAsGroup: 1000
+
+persistence:
+  enabled: true
+  existingClaim: ""
+  size: 10Gi
+  storageClass: default
+
+probes:
+  enabled: true
+  scheme: HTTPS
+  port: 9000
+  startup:
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    failureThreshold: 30
+  readiness:
+    periodSeconds: 10
+    failureThreshold: 3
+  liveness:
+    periodSeconds: 20
+    failureThreshold: 5
+
+resources:
+  requests:
+    memory: "1500Mi"
+    cpu: "500m"
+  limits:
+    memory: "2Gi"
+    cpu: "2000m"
+
+# Realm/client/role/group configuration is not templated by this chart — it
+# is applied post-deploy by charts/keycloak/scripts/configure-keycloak.sh,
+# run as a pipeline step in dpn-keycloak-cd.yaml. See that script's header
+# for the environment variables it reads.

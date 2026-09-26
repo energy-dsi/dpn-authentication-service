@@ -1,0 +1,137 @@
+/* ============================================================
+   DPN Portal — Keycloak login theme override
+   Extends keycloak.v2 (PatternFly v5). Loaded after the parent's own
+   css/styles.css (see theme.properties), so these rules win on source
+   order alone — no !important needed.
+
+   Brand palette mirrors app/dpn-portal/static/css/style.css exactly:
+     --dpn-brand-dark  #0d1f4c  (navy)
+     --dpn-brand-mid   #3f88ae  (steel blue)
+   Selectors below were confirmed against the actual Keycloak 26.3.2
+   keycloak.v2 theme (template.ftl / login.ftl / field.ftl / theme.properties),
+   not guessed from older Keycloak versions' PatternFly-4 markup.
+   ============================================================ */
+
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap');
+
+:root {
+  --dpn-brand-dark:   #0d1f4c;
+  --dpn-brand-mid:    #3f88ae;
+  --dpn-brand-subtle: #e6eff5;
+  --dpn-border:       #d4dde5;
+
+  /* Card top accent strip — theme.properties/styles.css already reads this
+     variable via `.pf-v5-c-login__main-header { border-top: 4px solid
+     var(--keycloak-card-top-color); }`, so no selector override needed. */
+  --keycloak-card-top-color: var(--dpn-brand-mid);
+}
+
+/* ── Base / background ──────────────────────────────────────────
+   Parent theme's `.login-pf body` rule paints Keycloak's own dark
+   background image; this replaces it with the portal's plain light
+   surface so the two products don't look like different vendors. */
+html.login-pf body {
+  background: #f4f7fa;
+  font-family: 'Poppins', -apple-system, 'Helvetica Neue', Arial, sans-serif;
+}
+
+body#keycloak-bg {
+  font-family: 'Poppins', -apple-system, 'Helvetica Neue', Arial, sans-serif;
+}
+
+/* ── Header wordmark ─────────────────────────────────────────────
+   #kc-header-wrapper renders realm.displayNameHtml verbatim (see
+   template.ftl) — dpn-realm.json's displayNameHtml is set to the
+   .dpn-kc-brand markup below: "DSI DPN Platform" as a single line. */
+#kc-header-wrapper.pf-v5-c-brand {
+  display: flex;
+  justify-content: center;
+}
+
+.dpn-kc-brand {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  padding: 10px 16px;
+  color: var(--dpn-brand-dark);
+  font-size: 26px;
+  line-height: 1.25;
+}
+.dpn-kc-brand strong { font-weight: 600; }
+
+/* ── Login card ──────────────────────────────────────────────────
+   .pf-v5-c-login__main is the white panel wrapping the whole form
+   (see template.ftl's <main class="${properties.kcLoginMain!}">). */
+.pf-v5-c-login__main {
+  background: #ffffff;
+  border-radius: 10px;
+  box-shadow: 0 6px 18px rgba(13, 31, 76, 0.12);
+  overflow: hidden;
+}
+
+.pf-v5-c-login__main-header {
+  padding-top: 32px;
+}
+
+#kc-page-title,
+.pf-v5-c-title.pf-m-3xl {
+  color: var(--dpn-brand-dark);
+  font-family: 'Poppins', -apple-system, 'Helvetica Neue', Arial, sans-serif;
+  font-weight: 300;
+}
+
+/* ── Form controls ──────────────────────────────────────────────── */
+.pf-v5-c-form-control {
+  border-radius: 6px;
+  border-color: var(--dpn-border);
+}
+.pf-v5-c-form-control:focus {
+  border-color: var(--dpn-brand-mid);
+  box-shadow: 0 0 0 1px var(--dpn-brand-mid);
+}
+
+.pf-v5-c-form__label-text {
+  color: var(--dpn-brand-dark);
+  font-weight: 500;
+}
+
+/* ── Primary action button (Sign In) ──────────────────────────────
+   Mirrors the portal's own CTA hover treatment: steel-blue at rest,
+   navy on hover/focus (see .dpn-shell-header__signout:hover /
+   .dpn-service-card__cta:hover in app/dpn-portal's stylesheet). */
+.pf-v5-c-button.pf-m-primary {
+  background-color: var(--dpn-brand-mid);
+  border-color: var(--dpn-brand-mid);
+  font-family: 'Poppins', -apple-system, 'Helvetica Neue', Arial, sans-serif;
+}
+.pf-v5-c-button.pf-m-primary:hover,
+.pf-v5-c-button.pf-m-primary:focus {
+  background-color: var(--dpn-brand-dark);
+  border-color: var(--dpn-brand-dark);
+}
+
+.pf-v5-c-button.pf-m-secondary,
+.pf-v5-c-button.pf-m-link {
+  color: var(--dpn-brand-dark);
+}
+.pf-v5-c-button.pf-m-secondary:hover,
+.pf-v5-c-button.pf-m-link:hover {
+  color: var(--dpn-brand-mid);
+}
+
+/* ── Links (forgot password, register, try-another-way) ──────────── */
+.pf-v5-c-login__main a,
+.pf-v5-c-login__main-footer a {
+  color: var(--dpn-brand-mid);
+}
+.pf-v5-c-login__main a:hover,
+.pf-v5-c-login__main-footer a:hover {
+  color: var(--dpn-brand-dark);
+}
+
+/* ── Alerts (invalid credentials, etc.) — keep readable, just retint
+   the accent to stay in-palette instead of PatternFly's default red/blue */
+.pf-v5-c-alert.pf-m-danger {
+  border-left-color: #b1373e;
+}

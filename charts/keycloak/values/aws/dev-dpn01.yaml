@@ -1,0 +1,52 @@
+# =============================================================================
+# Keycloak — AWS dev-dpn01 values
+# EKS     : <<your specific value>>
+# Account : <<your specific value>>
+# Region  : eu-west-2
+#
+# Content mirrors ../test-dpn01.yaml (deterministic substitution of
+# account/cluster/prefix identifiers only) — see that file for the
+# confirmed-working AWS pattern this is derived from.
+#
+# IAM role (dpn-keycloak-secrets-role) and Secrets Manager entries
+# (KC_DB_PASSWORD, KEYCLOAK_ADMIN_PASSWORD, KC_HTTPS_KEY_STORE_PASSWORD,
+# KC_HTTPS_TRUST_STORE_PASSWORD) are created under secretsManager.secretPrefix.
+# KC_HTTPS_KEY_STORE_PASSWORD / KC_HTTPS_TRUST_STORE_PASSWORD must match
+# whatever password was used to build dpn-tls's keystore.jks/truststore.jks.
+# =============================================================================
+
+cloudProvider: aws
+
+namespace: ns-dpn-01
+
+imagePullSecret: ghcr-pull-secret
+
+image:
+  repository: <<your specific value>>/keycloak
+
+postgres:
+  image:
+    repository: <<your specific value>>/postgres
+  persistence:
+    storageClassName: gp3
+
+config:
+  KC_HOSTNAME: ""
+  KC_HOSTNAME_STRICT: "false"
+
+service:
+  loadBalancer:
+    enabled: true
+
+serviceAccount:
+  create: true
+  automountServiceAccountToken: true   # required for IRSA
+  annotations:
+    eks.amazonaws.com/role-arn: "<<your specific value>>"
+
+secretsManager:
+  enabled: true
+  secretPrefix: "dpn/dev-dpn01/keycloak"
+
+persistence:
+  storageClass: gp3

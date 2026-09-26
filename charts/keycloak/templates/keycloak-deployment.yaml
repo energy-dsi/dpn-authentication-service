@@ -1,0 +1,205 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "keycloak.name" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "keycloak.selectorLabels" . | nindent 4 }}
+    {{- include "keycloak.labels" . | nindent 4 }}
+spec:
+  # A StatefulSet, not a Deployment, so that horizontal scaling (hpa.yaml)
+  # gives every replica its own PersistentVolumeClaim via volumeClaimTemplates
+  # below instead of all replicas fighting over one shared ReadWriteOnce
+  # claim (Azure Disk only attaches to one node at a time — a second replica
+  # on another node would sit stuck on a Multi-Attach error forever). Each
+  # pod's local volume is only its own JTA transaction-log recovery store;
+  # Keycloak's real state (realms, clients, users, sessions) all lives in the
+  # one shared Postgres every replica already points at via KC_DB_URL, so
+  # nothing here needs to be — or is safe to be — shared between replicas.
+  serviceName: {{ include "keycloak.name" . }}
+  # No ordering dependency between replicas, so start/scale them concurrently
+  # rather than the StatefulSet default of one-at-a-time.
+  podManagementPolicy: Parallel
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "keycloak.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "keycloak.selectorLabels" . | nindent 8 }}
+        {{- include "keycloak.labels" . | nindent 8 }}
+        {{- range $k, $v := .Values.serviceAccount.podLabels }}
+        {{ $k }}: {{ $v | quote }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "keycloak.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+
+      {{- if .Values.postgres.enabled }}
+      initContainers:
+        - name: wait-for-postgres
+          image: "{{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}"
+          imagePullPolicy: {{ .Values.postgres.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h {{ .Values.postgres.name }} -p {{ .Values.postgres.port }} -U {{ .Values.postgres.username }}; do
+                echo "Waiting for {{ .Values.postgres.name }}:{{ .Values.postgres.port }} ..."
+                sleep 5
+              done
+              echo "PostgreSQL is ready."
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+      {{- end }}
+
+      containers:
+        - name: keycloak
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          args: ["start"]
+
+          securityContext:
+            allowPrivilegeEscalation: false
+
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+          ports:
+            - name: https
+              containerPort: {{ .Values.config.KC_HTTPS_PORT | int }}
+              protocol: TCP
+            {{- if .Values.probes.enabled }}
+            - name: management
+              containerPort: {{ .Values.probes.port }}
+              protocol: TCP
+            {{- end }}
+
+          envFrom:
+            - configMapRef:
+                name: {{ include "keycloak.name" . }}-config
+            - secretRef:
+                name: {{ include "keycloak.name" . }}-secrets
+
+          # KC_HTTPS_KEY_STORE_PASSWORD / KC_HTTPS_TRUST_STORE_PASSWORD are no
+          # longer part of dpn-keycloak-secrets (it no longer duplicates these
+          # Key Vault values) — sourced explicitly from the shared
+          # tls-auth-secret (created once by dpn-tls-cd) instead.
+          env:
+            - name: KC_HTTPS_KEY_STORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: tls-auth-secret
+                  key: KEYSTORE_PASSWORD
+            - name: KC_HTTPS_TRUST_STORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: tls-auth-secret
+                  key: TRUSTSTORE_PASSWORD
+
+          {{- if .Values.probes.enabled }}
+          startupProbe:
+            httpGet:
+              path: /health/started
+              port: management
+              scheme: {{ .Values.probes.scheme }}
+            initialDelaySeconds: {{ .Values.probes.startup.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: management
+              scheme: {{ .Values.probes.scheme }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: management
+              scheme: {{ .Values.probes.scheme }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          {{- end }}
+
+          volumeMounts:
+            - name: keycloak-data
+              mountPath: /opt/keycloak/data
+            - name: keycloak-tmp
+              mountPath: /opt/keycloak/data/tmp
+            - name: keycloak-cert
+              mountPath: {{ .Values.tlsMountPath }}
+              readOnly: true
+            - name: keyvault-secrets
+              mountPath: /mnt/keyvault
+              readOnly: true
+            - name: theme-dpn-portal
+              mountPath: /opt/keycloak/themes/dpn-portal
+              readOnly: true
+
+      volumes:
+        {{- if or (not .Values.persistence.enabled) .Values.persistence.existingClaim }}
+        - name: keycloak-data
+          {{- if .Values.persistence.enabled }}
+          # Escape hatch for a pre-provisioned claim — only correct at
+          # replicaCount: 1, since every replica would otherwise share this
+          # one claim by name (the exact Multi-Attach problem
+          # volumeClaimTemplates below avoids).
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- end }}
+        - name: keycloak-tmp
+          emptyDir: {}
+        - name: keycloak-cert
+          secret:
+            secretName: {{ .Values.tlsSecretName }}
+        - name: keyvault-secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ include "keycloak.secretProviderClassName" . }}
+        - name: theme-dpn-portal
+          configMap:
+            name: {{ include "keycloak.name" . }}-theme-dpn-portal
+            items:
+              - key: theme.properties
+                path: login/theme.properties
+              - key: dpn-portal.css
+                path: login/resources/css/dpn-portal.css
+
+  {{- if and .Values.persistence.enabled (not .Values.persistence.existingClaim) }}
+  volumeClaimTemplates:
+    - metadata:
+        name: keycloak-data
+        labels:
+          {{- include "keycloak.selectorLabels" . | nindent 10 }}
+          {{- include "keycloak.labels" . | nindent 10 }}
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | default "10Gi" }}
+        storageClassName: {{ .Values.persistence.storageClass | default "default" }}
+  {{- end }}

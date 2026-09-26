@@ -1,0 +1,36 @@
+{{- include "keycloak.validate" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "keycloak.name" . }}-config
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "keycloak.selectorLabels" . | nindent 4 }}
+    {{- include "keycloak.labels" . | nindent 4 }}
+data:
+  KC_DB: {{ .Values.config.KC_DB | quote }}
+  KC_DB_URL: {{ .Values.config.KC_DB_URL | quote }}
+  KC_DB_USERNAME: {{ .Values.config.KC_DB_USERNAME | quote }}
+  KEYCLOAK_ADMIN: {{ .Values.config.KEYCLOAK_ADMIN | quote }}
+
+  {{- if .Values.config.KC_HOSTNAME }}
+  KC_HOSTNAME: {{ .Values.config.KC_HOSTNAME | quote }}
+  {{- end }}
+  {{- if .Values.config.KC_HOSTNAME_ADMIN }}
+  KC_HOSTNAME_ADMIN: {{ .Values.config.KC_HOSTNAME_ADMIN | quote }}
+  {{- end }}
+  KC_HOSTNAME_STRICT: {{ .Values.config.KC_HOSTNAME_STRICT | quote }}
+  KC_HOSTNAME_STRICT_HTTPS: {{ .Values.config.KC_HOSTNAME_STRICT_HTTPS | quote }}
+
+  KC_HTTP_ENABLED: {{ .Values.config.KC_HTTP_ENABLED | quote }}
+  KC_HTTPS_ENABLED: {{ .Values.config.KC_HTTPS_ENABLED | quote }}
+  KC_HTTPS_PORT: {{ .Values.config.KC_HTTPS_PORT | quote }}
+  KC_HTTPS_CLIENT_AUTH: {{ .Values.config.KC_HTTPS_CLIENT_AUTH | quote }}
+  {{- if .Values.config.KC_HTTPS_KEY_ALIAS }}
+  KC_HTTPS_KEY_ALIAS: {{ .Values.config.KC_HTTPS_KEY_ALIAS | quote }}
+  {{- end }}
+  KC_HTTPS_KEY_STORE_FILE: {{ .Values.config.KC_HTTPS_KEY_STORE_FILE | quote }}
+  KC_HTTPS_TRUST_STORE_FILE: {{ .Values.config.KC_HTTPS_TRUST_STORE_FILE | quote }}
+
+  KC_HEALTH_ENABLED: {{ .Values.config.KC_HEALTH_ENABLED | quote }}
+  KC_LOG_LEVEL: {{ .Values.config.KC_LOG_LEVEL | quote }}
