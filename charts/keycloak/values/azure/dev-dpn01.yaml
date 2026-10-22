@@ -1,0 +1,22 @@
+image:
+  repository: "<<your specific value>>/keycloak"
+
+postgres:
+  image:
+    repository: "<<your specific value>>/postgres"
+
+config:
+  # Reachable on the internal LB IP, via port-forward and on the in-cluster
+  # DNS name, so no single hostname is correct. Derive it from the request.
+  KC_HOSTNAME: ""
+  KC_HOSTNAME_STRICT: "false"
+
+service:
+  loadBalancer:
+    # Confirmed live and pinned.
+    loadBalancerIP: <<your specific value>>
+
+keyvault:
+  clientID: "<<your specific value>>"
+  name: "<<your specific value>>"
+  tenantId: "<<your specific value>>"

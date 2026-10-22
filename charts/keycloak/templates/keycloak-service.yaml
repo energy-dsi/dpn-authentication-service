@@ -1,0 +1,53 @@
+{{- $name := include "keycloak.name" . }}
+{{- if .Values.service.clusterIP.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "keycloak.selectorLabels" . | nindent 4 }}
+    {{- include "keycloak.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "keycloak.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: https
+      port: {{ .Values.service.clusterIP.port }}
+      targetPort: {{ .Values.service.clusterIP.port }}
+      protocol: TCP
+{{- end }}
+
+{{- if .Values.service.loadBalancer.enabled }}
+---
+# Internal Azure Load Balancer — VNet access only, never public.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-service-lb
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "keycloak.selectorLabels" . | nindent 4 }}
+    {{- include "keycloak.labels" . | nindent 4 }}
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+    {{- if .Values.service.loadBalancer.loadBalancerIP }}
+    # Pins the frontend IP. The spec field below is deprecated upstream, so
+    # this annotation is what current AKS actually honours.
+    service.beta.kubernetes.io/azure-load-balancer-ipv4: {{ .Values.service.loadBalancer.loadBalancerIP | quote }}
+    {{- end }}
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    {{- include "keycloak.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: https
+      port: {{ .Values.service.loadBalancer.port }}
+      targetPort: {{ .Values.service.loadBalancer.port }}
+      protocol: TCP
+  {{- if .Values.service.loadBalancer.loadBalancerIP }}
+  loadBalancerIP: <<your specific value>>
+  {{- end }}
+{{- end }}

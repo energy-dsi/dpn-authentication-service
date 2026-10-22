@@ -1,0 +1,6 @@
+apiVersion: v2
+name: keycloak
+description: Keycloak non-mTLS HTTPS deployment with internal load balancer — DPN Platform
+type: application
+version: 1.0.0
+appVersion: "26.3.2"

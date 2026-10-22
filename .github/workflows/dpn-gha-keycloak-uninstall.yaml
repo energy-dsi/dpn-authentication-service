@@ -1,0 +1,136 @@
+name: DPN Uninstall - Keycloak
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Select Environment"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - test
+
+      cluster:
+        description: "Target DPN Cluster"
+        required: true
+        default: "dpn01"
+        type: choice
+        options:
+          - dpn01
+          - dpn02
+
+      cloud:
+        description: "Target Cloud Provider"
+        required: true
+        default: "aws"
+        type: choice
+        options:
+          - azure
+          - aws
+
+      deletePvc:
+        description: "DESTRUCTIVE — also delete the PostgreSQL PVC (all realms, users and clients are lost)"
+        required: true
+        default: false
+        type: boolean
+
+      confirm:
+        description: 'Type "dpn-keycloak" to confirm'
+        required: true
+        type: string
+
+env:
+  PARAMETERS_FILE: .github/config/${{ inputs.cloud }}/${{ inputs.environment }}-${{ inputs.cluster }}.json
+  RELEASE_NAME: dpn-keycloak
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  uninstall:
+    name: Helm Uninstall - Keycloak
+    runs-on: [self-hosted, vmss]
+    environment: ${{ inputs.environment }}-${{ inputs.cluster }}
+    steps:
+      - name: Validate Confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.confirm }}" != "dpn-keycloak" ]]; then
+            echo "ERROR: confirmation text '${{ inputs.confirm }}' does not match 'dpn-keycloak'."
+            echo "Aborting — nothing was touched."
+            exit 1
+          fi
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Read Deployment Config
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f "${PARAMETERS_FILE}" ]; then
+            echo "ERROR: ${PARAMETERS_FILE} not found!"
+            exit 1
+          fi
+          for key in $(jq -r 'keys_unsorted[]' "${PARAMETERS_FILE}"); do
+            value=$(jq -r ".\"$key\"" "${PARAMETERS_FILE}")
+            echo "${key}=${value}" >> "$GITHUB_ENV"
+          done
+
+      - name: Pre-Uninstall Checklist
+        shell: bash
+        run: |
+          echo "CONFIRM BEFORE PROCEEDING:"
+          echo "1. This uninstalls the Helm release '$RELEASE_NAME' (Keycloak StatefulSet + bundled Postgres Deployment)"
+          echo "2. deletePvc=${{ inputs.deletePvc }} — 'helm uninstall' never deletes the Postgres PVC itself"
+          echo "   (it's created by the StatefulSet's volumeClaimTemplates, not the chart); deletePvc=true"
+          echo "   additionally deletes it explicitly, permanently destroying all realms/users/clients."
+          echo "3. Secrets in the cloud secrets backend (KEYCLOAK_ADMIN_PASSWORD, KC_DB_PASSWORD, etc.) are untouched"
+          echo "4. Other components depending on this Keycloak instance (oauth2-proxy releases, Airflow SSO,"
+          echo "   federator gateway's Vault AppRole flow, etc.) will start failing auth once this is removed"
+
+      - name: Cloud Login
+        uses: ./.github/actions/cloud-login
+        with:
+          cloud: ${{ inputs.cloud }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          aws-region: ${{ env.AWS_REGION }}
+          aws-account-id: ${{ env.AWS_ACCOUNT_ID }}
+          eks-cluster: ${{ env.EKS_CLUSTER }}
+
+      - name: Helm Uninstall
+        shell: bash
+        run: |
+          set -euo pipefail
+          if helm status "$RELEASE_NAME" -n "$NAMESPACE" >/dev/null 2>&1; then
+            helm uninstall "$RELEASE_NAME" -n "$NAMESPACE" --wait --timeout 10m
+            echo "Release $RELEASE_NAME uninstalled."
+          else
+            echo "Release '$RELEASE_NAME' not found in namespace '$NAMESPACE'. Nothing to uninstall."
+          fi
+
+          if [ "${{ inputs.deletePvc }}" = "true" ]; then
+            echo "=========================================="
+            echo " DELETING POSTGRESQL PVC (DESTRUCTIVE)"
+            echo "=========================================="
+            kubectl delete pvc "dpn-keycloak-postgres-data" -n "$NAMESPACE" --ignore-not-found
+            echo "PVC dpn-keycloak-postgres-data deleted."
+          else
+            echo "PVC dpn-keycloak-postgres-data kept — realm data survives for a reinstall."
+            kubectl get pvc "dpn-keycloak-postgres-data" -n "$NAMESPACE" || true
+          fi
+
+      - name: Verification
+        shell: bash
+        run: |
+          echo "Remaining Helm releases in $NAMESPACE:"
+          helm list -n "$NAMESPACE"
+          echo "Remaining pods matching keycloak:"
+          kubectl get pods -n "$NAMESPACE" | grep keycloak || echo "(none)"
+          echo "Remaining PVCs:"
+          kubectl get pvc -n "$NAMESPACE" | grep -i keycloak || echo "(none found)"
