@@ -1,0 +1,200 @@
+trigger: none
+
+parameters:
+
+  - name: ServiceConnection
+    displayName: 'ServiceConnection details'
+    type: string
+    default: 'sc-dpn-dev-001'
+    values:
+      - sc-dpn-dev-001
+      - sc-dpn-dev-002
+      - sc-dpn-test-001
+      - sc-dpn-test-002
+      - sc-dpn-pdev-ppd-001
+      - sc-dpn-ptest-ppd-001
+      - sc-dpn-puat-ppd-001
+
+  - name: environment
+    displayName: Environment Name
+    type: string
+    default: 'dev'
+    values:
+      - dev
+      - devtest
+      - test
+      - pdev
+      - ptest
+      - puat
+
+  - name: dpnCluster
+    displayName: "Target DPN Cluster (pdev/ptest/puat have only one DPN — dpn02 is disabled for those environments)"
+    type: string
+    default: dpn01
+    values:
+      - dpn01
+      - dpn02
+
+  - name: deletePvc
+    displayName: "DESTRUCTIVE — also delete the PostgreSQL PVC (all realms, users and clients are lost)"
+    type: boolean
+    default: false
+
+variables:
+  - name: RELEASE_NAME
+    value: "dpn-keycloak"
+
+  - name: KEYCLOAK_FULL_NAME
+    value: "dpn-keycloak"
+
+  - name: POSTGRES_FULL_NAME
+    value: "dpn-keycloak-postgres"
+
+  - name: PARAMETERS_FILE
+    value: ".pipelines/azure-pipelines/config/${{ parameters.environment }}-${{ parameters.dpnCluster }}.json"
+
+  - ${{ if or(eq(parameters.environment, 'pdev'), eq(parameters.environment, 'ptest'), eq(parameters.environment, 'puat')) }}:
+    - name: APPROVAL_GROUP
+      value: dsi-ppd
+  - ${{ elseif or(eq(parameters.environment, 'devtest'), eq(parameters.environment, 'test')) }}:
+    - name: APPROVAL_GROUP
+      value: dsi-devtest
+  - ${{ else }}:
+    - name: APPROVAL_GROUP
+      value: dsi-dev
+
+# =============================================================================
+# Stage 1 — Guard (pdev/ptest/puat only have one DPN; dpn02 is disabled)
+# =============================================================================
+stages:
+- stage: GuardSingleDpn
+  displayName: "Guard — Single DPN Environments"
+  jobs:
+  - job: Block
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+    steps:
+    - script: |
+        ENV="${{ parameters.environment }}"
+        CLUSTER="${{ parameters.dpnCluster }}"
+        if printf '%s' "$ENV" | grep -qE '^(pdev|ptest|puat)$' && [ "$CLUSTER" = "dpn02" ]; then
+          echo "##[error]dpn02 is disabled for environment '$ENV' — it has only a single DPN."
+          exit 1
+        fi
+        echo "Guard passed: environment '$ENV' with cluster '$CLUSTER' is a valid combination."
+      displayName: "Validate DPN cluster for environment"
+
+# =============================================================================
+# Stage 2 — Approval Gate
+# =============================================================================
+- stage: Approval
+  displayName: "Approval Gate"
+  dependsOn: GuardSingleDpn
+  condition: succeeded()
+
+  jobs:
+  - deployment: ApprovalJob
+    displayName: "Approve Keycloak Uninstall"
+    environment: "$(APPROVAL_GROUP)"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              echo "=========================================="
+              echo " APPROVAL REQUIRED BEFORE KEYCLOAK UNINSTALL"
+              echo "=========================================="
+              echo "Environment : ${{ parameters.environment }}"
+              echo "Cluster     : ${{ parameters.dpnCluster }}"
+              echo "Release     : $(RELEASE_NAME)"
+              echo "Delete PVC  : ${{ parameters.deletePvc }}"
+              if [ "${{ parameters.deletePvc }}" = "True" ] || [ "${{ parameters.deletePvc }}" = "true" ]; then
+                echo ""
+                echo "##[warning]deletePvc is TRUE — all Keycloak realms, users and clients"
+                echo "##[warning]in this environment will be permanently destroyed."
+              fi
+              echo "=========================================="
+
+# =============================================================================
+# Stage 3 — Uninstall
+# =============================================================================
+- stage: Uninstall
+  displayName: "Uninstall Keycloak [${{ parameters.environment }}-${{ parameters.dpnCluster }}]"
+  dependsOn:
+  - GuardSingleDpn
+  - Approval
+  condition: succeeded()
+
+  jobs:
+  - deployment: UninstallKeycloak
+    displayName: "Helm Uninstall"
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+    environment: "$(APPROVAL_GROUP)"
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - script: |
+              for param in $(jq -r 'keys_unsorted | .[]' "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)"); do
+                value=$(jq -r ".\"$param\"" "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)")
+                echo "##vso[task.setvariable variable=$param]$value"
+              done
+            displayName: "Load Environment Config"
+
+          - task: AzureCLI@2
+            displayName: "Helm Uninstall Keycloak"
+            inputs:
+              azureSubscription: "${{ parameters.ServiceConnection }}"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                which kubelogin >/dev/null 2>&1 || az aks install-cli --client-version v1.31.0 --kubelogin-version v0.1.4
+                az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+                az aks get-credentials \
+                  --resource-group $(RESOURCE_GROUP) \
+                  --name $(AKS_CLUSTER) \
+                  --overwrite-existing
+                kubelogin convert-kubeconfig -l azurecli
+
+                echo "=========================================="
+                echo " CURRENT STATE"
+                echo "=========================================="
+                helm list -n $(NAMESPACE) || true
+                kubectl get pods -n $(NAMESPACE) -l app=$(KEYCLOAK_FULL_NAME) || true
+
+                echo "=========================================="
+                echo " UNINSTALL RELEASE $(RELEASE_NAME)"
+                echo "=========================================="
+                if helm status $(RELEASE_NAME) -n $(NAMESPACE) >/dev/null 2>&1; then
+                  helm uninstall $(RELEASE_NAME) -n $(NAMESPACE) --wait --timeout 10m
+                  echo "Release $(RELEASE_NAME) uninstalled."
+                else
+                  echo "Release $(RELEASE_NAME) not found in $(NAMESPACE) — nothing to uninstall."
+                fi
+
+                if [ "${{ parameters.deletePvc }}" = "True" ] || [ "${{ parameters.deletePvc }}" = "true" ]; then
+                  echo "=========================================="
+                  echo " DELETING POSTGRESQL PVC (DESTRUCTIVE)"
+                  echo "=========================================="
+                  kubectl delete pvc $(POSTGRES_FULL_NAME)-data -n $(NAMESPACE) --ignore-not-found
+                  echo "PVC $(POSTGRES_FULL_NAME)-data deleted."
+                else
+                  echo "=========================================="
+                  echo " POSTGRESQL PVC RETAINED"
+                  echo "=========================================="
+                  echo "PVC $(POSTGRES_FULL_NAME)-data kept — realm data survives for a reinstall."
+                  kubectl get pvc $(POSTGRES_FULL_NAME)-data -n $(NAMESPACE) || true
+                fi
+
+                echo "=========================================="
+                echo " REMAINING RESOURCES"
+                echo "=========================================="
+                kubectl get all -n $(NAMESPACE) -l app.kubernetes.io/name=$(KEYCLOAK_FULL_NAME) || true
+
+                echo "Uninstall complete."
